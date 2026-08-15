@@ -1,0 +1,69 @@
+# ---- secrets -------------------------------------------------------------
+# .env.rapid holds the Bybit API secret and the Telegram bot token (§2, §9.2).
+# Never commit it. Keep .env.rapid.example as the checked-in template.
+.env
+.env.*
+!.env.*.example
+
+# ---- live runtime state --------------------------------------------------
+# rapid_state.json is the account's source of truth for float, bank and trade
+# history (§8). It is per-deployment and must never be shared between the
+# server and a laptop -- committing it risks restoring a stale float or an
+# orphaned position record.
+rapid_state.json
+*_state.json
+*.corrupt.bak
+
+# process lock (main.py ProcessLock) -- machine-local, never shared
+*.lock
+
+# logs
+*.log
+rapid_bot.log
+
+# atomic-save temp files: state.py writes tempfile.NamedTemporaryFile into the
+# state directory before os.replace, so an interrupted save can leave one behind
+tmp*.tmp
+tmp[0-9a-z_]*
+!tmp*.py
+
+# ---- python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- editors / OS --------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ---- backups / scratch ---------------------------------------------------
+*.bak
+*.backup
+*.orig
+*_backup.py
+*.py.bak_*
+
+# ---- market data ---------------------------------------------------------
+# data/*.parquet IS committed on purpose: tests/test_regression_canary.py needs
+# it to reproduce the +27.1% / 8-trade / -32.3% canary that guards against
+# strategy drift (§11). Total is ~2.9 MB. Regenerate with fetch_data.py.
+# Uncomment below if you would rather keep the repo binary-free:
+# data/*.parquet

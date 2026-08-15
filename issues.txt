@@ -1,0 +1,34 @@
+All 19 tests pass now, including the new canary regression, foreign-position, and dry-run stop tests. Fifteen of the sixteen items are genuinely fixed — stop recomputed from the actual fill (exchange.py:360), foreign positions halt without closing, ensure_trading_stop with retry-then-flatten, commit_bar after successful processing, the RLock, staleness measured from bar close, same-bar reversal, one-way assertion, fail-fast filters, a real gate in validate.py.
+
+Three of the new mechanisms have bugs, though, and two are load-bearing.
+
+1. Fees are double-counted — and differently in live vs dry run
+Bybit's closedPnl is already net of both fees, and cumEntryFee/cumExitFee don't exist in the V5 closed-pnl response. From the documented response body (verified against ccxt's captured sample): entry value 1.8135, exit value 1.815, raw P&L +0.0015, fees 0.001995, closedPnl: -0.00049568 — exactly raw minus both fees. The fields present are closedPnl, avgEntryPrice, avgExitPrice, qty, closedSize, cumEntryValue, cumExitValue, orderPrice, fillCount, execType, createdTime, updatedTime.
+
+So exchange.py:504 yields cum_fee = 0.0 in live, and main.py:260 does net = closedPnl - 0, which is right — except the entry fee was already deducted at main.py:509-510, so the entry fee is charged twice and state.cum_fees only ever sees the locally-estimated entry side. §3.3 wanted fees visible; in live they'll be roughly half-visible.
+
+Dry run is wrong the other way, and your own test output proves it:
+
+
+Entry: $60,000 -> Exit: $57,000 | Net PnL: $-9.19 USDT (Fee: $0.09) | Float: $90.81
+Raw P&L is −$9.00 and the fee is $0.094, so the answer should be −$9.09. The mock's closed_pnl is already pnl - fee (exchange.py:449) and main.py:260 subtracts cum_fee again → −$9.188. The assertion in test_dry_run_intrabar_stop_simulation only checks the exit price, so it passes.
+
+Fix: treat closedPnl as final (net_trade_pnl = closed_pnl_res.closed_pnl), derive the fee for reporting only from cumEntryValue/cumExitValue, and stop deducting the entry fee separately at entry. Live and dry run being wrong in opposite directions also means the Phase 2 P&L comparison can't reconcile.
+
+2. get_last_closed_pnl can book the previous trade
+exchange.py:475-479 sleeps a flat 1.0s after the exit order, then takes limit=1 from closed-pnl. If Bybit hasn't published the record yet, that's the previous trade's numbers — booked as this trade's P&L, into float, into bank, and into the 15% stop-failure detector. Nothing checks that the record is new. Poll until updatedTime exceeds the entry, and assert closedSize == pos.qty, rather than sleeping once.
+
+3. The dry-run stop fires on the entry bar itself — 21% of entries
+main.py:371-375 tests df_klines.iloc[-1] every 60s, and for the ~59 minutes after an entry that last closed bar is the entry bar. backtest.py opens at step 5 and doesn't stop-check until the next bar (backtest.py:114 precedes backtest.py:179), so the entry bar's own range never touches the stop there.
+
+I measured it across the full history:
+
+
+entry bars whose own range already breaches the new stop: 15 / 70
+More than one entry in five would take an instant phantom stop-out in dry run that the backtest never produces — e.g. 2023-03-14 12:00, long at 25,864.9 with a stop at 24,602.7, on a bar whose low was 24,401.4. This makes the Phase 2 gate unpassable. Guard the check to skip any bar whose timestamp is <= state.position.entry_bar_ts.
+
+Smaller
+last_processed_funding_ts isn't persisted (main.py:95) — it's an instance attribute reset to 0 on every start, and last_funding_check_hour resets to −1 too. Restart within the same funding hour and the settlement gets charged twice. It belongs in BotState.
+Liq distance is a constant, not the real number: main.py:205 prints 100/leverage ≈ 20%, ignoring the actual liqPrice you already fetch into PositionInfo.
+Optional isn't imported in main.py (main.py:244). Harmless today — local variable annotations aren't evaluated at runtime, and I confirmed that — but it breaks the moment that line moves to module or class scope.
+If the process dies in the ~microsecond window between place_entry_with_stop returning and main.py:511 saving state, restart sees its own position as foreign and halts. That's the safe direction and spec-compliant, just worth knowing before it happens on testnet.
