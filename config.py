@@ -28,6 +28,8 @@ class Config:
     trend_veto_hours: int
     allow_long: bool
     allow_short: bool
+    breakeven_enabled: bool
+    breakeven_trigger_r: float
 
     # Sizing
     base_capital: float
@@ -114,6 +116,9 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
     allow_long = env.get("ALLOW_LONG", "1").lower() in ("1", "true", "yes")
     allow_short = env.get("ALLOW_SHORT", "1").lower() in ("1", "true", "yes")
 
+    breakeven_enabled = env.get("BREAKEVEN_ENABLED", "1").lower() in ("1", "true", "yes")
+    breakeven_trigger_r = float(env.get("BREAKEVEN_TRIGGER_R", "2.0"))
+
     base_capital = float(env.get("BASE_CAPITAL", "100.0"))
     risk_frac = float(env.get("RISK_FRAC", "0.05"))
     max_leverage = float(env.get("MAX_LEVERAGE", "5.0"))
@@ -140,6 +145,7 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
     assert warmup_bars >= entry_channel_hours + atr_period, (
         f"WARMUP_BARS ({warmup_bars}) must be >= {entry_channel_hours + atr_period}"
     )
+    assert breakeven_trigger_r > 0, f"BREAKEVEN_TRIGGER_R must be > 0, got {breakeven_trigger_r}"
     assert capital_policy in ("skim_refill", "compound"), f"Invalid capital policy: {capital_policy}"
     assert base_capital > 0, "BASE_CAPITAL must be positive"
     assert 0 < risk_frac <= 0.20, f"RISK_FRAC must be in (0, 0.20], got {risk_frac}"
@@ -166,6 +172,8 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
         trend_veto_hours=trend_veto_hours,
         allow_long=allow_long,
         allow_short=allow_short,
+        breakeven_enabled=breakeven_enabled,
+        breakeven_trigger_r=breakeven_trigger_r,
         base_capital=base_capital,
         risk_frac=risk_frac,
         max_leverage=max_leverage,

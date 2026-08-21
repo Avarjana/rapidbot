@@ -18,6 +18,8 @@ class PositionState:
     stop_price: float
     entry_bar_ts: int
     entry_order_id: str
+    initial_stop_price: float = 0.0  # frozen at entry; stop_price may move (breakeven), this doesn't
+    breakeven_triggered: bool = False
 
 
 @dataclass

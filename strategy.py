@@ -197,3 +197,46 @@ def check_channel_exit(
     elif side in ("Sell", "short", "Short"):
         return close_price > exit_high
     return False
+
+
+def check_breakeven_trigger(
+    side: str,
+    entry_price: float,
+    initial_stop_price: float,
+    high_price: float,
+    low_price: float,
+    trigger_r: float = 2.0,
+) -> bool:
+    """True if this bar's range reached `trigger_r` multiples of the initial risk
+    (R = |entry_price - initial_stop_price|) in the trade's favor.
+
+    Backtested and validated (train/test split, 2020-2023 train -> 2024-2026 test)
+    in backtest_breakeven.py before being wired in here. One-time trigger — caller
+    is responsible for only acting on it once per trade.
+    """
+    r = abs(entry_price - initial_stop_price)
+    if r <= 0:
+        return False
+
+    if side in ("Buy", "long", "Long"):
+        return high_price >= entry_price + trigger_r * r
+    elif side in ("Sell", "short", "Short"):
+        return low_price <= entry_price - trigger_r * r
+    return False
+
+
+def compute_breakeven_stop_price(
+    side: str,
+    entry_price: float,
+    taker_fee_rate: float = 0.00055,
+    tick_size: float = 0.1,
+) -> float:
+    """Breakeven stop = entry price plus a buffer covering the round-trip taker
+    fee, so a breakeven exit doesn't quietly become a small net loss.
+    """
+    if side in ("Buy", "long", "Long"):
+        raw = entry_price * (1 + 2 * taker_fee_rate)
+    else:
+        raw = entry_price * (1 - 2 * taker_fee_rate)
+
+    return quantize_price(raw, tick_size)

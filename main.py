@@ -28,7 +28,9 @@ from risk import (
 )
 from state import BotState, PositionState, StateManager
 from strategy import (
+    check_breakeven_trigger,
     check_channel_exit,
+    compute_breakeven_stop_price,
     compute_indicators,
     compute_position_size,
     compute_stop_price,
@@ -185,10 +187,109 @@ class RapidBot:
                 f"• Total Equity: ${self.state.float_usdt + self.state.bank_usdt:.2f} USDT\n"
                 f"• Paused: {self.state.paused} | Halted: {self.state.halted}\n"
                 f"• Position:\n{pos_str}\n"
+                f"• Next order:\n{self._describe_next_order(pos)}\n"
                 f"• Cum Fees: ${self.state.cum_fees:.2f} | Cum Funding: ${self.state.cum_funding:.2f}\n"
                 f"• Trades: {len(self.state.trades)}"
             )
             return status_msg
+
+    def _describe_next_order(self, pos: PositionInfo) -> str:
+        """Describe the order the bot is waiting to place and how far price is from it.
+
+        Flat  -> the entry triggers (40h channel breaks), with the mom30 veto applied.
+        In position -> the channel exit level and the exchange stop, whichever comes first.
+        Levels are recomputed from the same closed bars the strategy uses, so they match
+        exactly what _process_closed_bar will evaluate on the next bar close.
+        """
+        if self.state.halted:
+            return f"  None - bot HALTED ({self.state.halt_reason})"
+
+        df = self.data_mgr.df_klines
+        min_bars = self.cfg.entry_channel_hours + self.cfg.atr_period
+        if df.empty or len(df) < min_bars:
+            return f"  Unavailable - only {len(df)} bars loaded, need {min_bars}"
+
+        ind = compute_indicators(
+            df,
+            entry_channel_hours=self.cfg.entry_channel_hours,
+            exit_channel_hours=self.cfg.exit_channel_hours,
+            mom_hours=self.cfg.trend_veto_hours,
+            atr_period=self.cfg.atr_period,
+        )
+        row = ind.iloc[-1]
+        close_p = float(row["close"])
+        if pd.isna(row["entry_high"]) or pd.isna(row["atr"]):
+            return "  Unavailable - indicators still warming up"
+
+        def away(level: float) -> str:
+            return f"{(level / close_p - 1.0) * 100.0:+.2f}%"
+
+        lines = [f"  Last close: ${close_p:,.2f} (bar {ind.index[-1]:%Y-%m-%d %H:%M} UTC)"]
+
+        if pos.size > 0:
+            # In a trade: the next order is an exit. Two ways out, whichever hits first.
+            xh, xl = float(row["exit_high"]), float(row["exit_low"])
+            if pos.side == "Buy":
+                lines.append(f"  SELL to close on 1h close < ${xl:,.2f} ({away(xl)})")
+            else:
+                lines.append(f"  BUY to close on 1h close > ${xh:,.2f} ({away(xh)})")
+            if pos.stop_loss > 0:
+                lines.append(f"  Stop (on exchange, intrabar) ${pos.stop_loss:,.2f} ({away(pos.stop_loss)})")
+            else:
+                lines.append("  ⚠️ No stop detected on the exchange position")
+
+            ps = self.state.position
+            if self.cfg.breakeven_enabled and ps is not None:
+                if ps.breakeven_triggered:
+                    lines.append(f"  Breakeven: already triggered, stop is at breakeven+fees")
+                elif ps.initial_stop_price > 0:
+                    r = abs(ps.entry_price - ps.initial_stop_price)
+                    trig = ps.entry_price + self.cfg.breakeven_trigger_r * r if pos.side == "Buy" else ps.entry_price - self.cfg.breakeven_trigger_r * r
+                    lines.append(f"  Breakeven: stop moves to ~${ps.entry_price:,.2f} on 1h high/low reaching ${trig:,.2f} ({away(trig)})")
+                else:
+                    lines.append("  Breakeven: not tracked for this position (opened before this feature)")
+            return "\n".join(lines)
+
+        # Flat: the next order is an entry, if the mom30 veto allows that direction.
+        eh, el = float(row["entry_high"]), float(row["entry_low"])
+        mom, atr = float(row["mom30"]), float(row["atr"])
+
+        if self.cfg.allow_long and mom >= 0:
+            lines.append(f"  BUY on 1h close > ${eh:,.2f} ({away(eh)})")
+        else:
+            reason = "ALLOW_LONG=0" if not self.cfg.allow_long else f"mom30 {mom*100:+.2f}% < 0"
+            lines.append(f"  BUY vetoed ({reason}) - would trigger > ${eh:,.2f} ({away(eh)})")
+
+        if self.cfg.allow_short and mom <= 0:
+            lines.append(f"  SELL on 1h close < ${el:,.2f} ({away(el)})")
+        else:
+            reason = "ALLOW_SHORT=0" if not self.cfg.allow_short else f"mom30 {mom*100:+.2f}% > 0"
+            lines.append(f"  SELL vetoed ({reason}) - would trigger < ${el:,.2f} ({away(el)})")
+
+        qty, stop_dist, valid, reason = compute_position_size(
+            float_usdt=self.state.float_usdt,
+            close_price=close_p,
+            atr_val=atr,
+            risk_frac=self.cfg.risk_frac,
+            max_leverage=self.cfg.max_leverage,
+            atr_mult=self.cfg.atr_mult,
+            qty_step=self.filters.qty_step,
+            min_order_qty=self.filters.min_order_qty,
+            min_notional=self.filters.min_notional,
+        )
+        if valid:
+            notional = qty * close_p
+            lines.append(
+                f"  Size if it fires: {qty} BTC = ${notional:,.2f} "
+                f"({notional / self.state.float_usdt:.2f}x), stop {stop_dist / close_p * 100:.2f}% "
+                f"= ${qty * stop_dist:.2f} risk"
+            )
+        else:
+            lines.append(f"  ⚠️ Would be REJECTED: {reason}")
+
+        if self.state.paused:
+            lines.append("  ⏸️ PAUSED - no entry will be taken until /resume")
+        return "\n".join(lines)
 
     def _cmd_pause(self) -> str:
         with self.lock:
@@ -568,6 +669,39 @@ class RapidBot:
 
         pos = self.exchange.get_position()
 
+        # Step 0: If In Position -> Check Breakeven Trigger (one-time stop ratchet)
+        # initial_stop_price==0 means this position pre-dates this feature (legacy
+        # state, no R data) -- skip it rather than guess, matches only NEW trades.
+        if pos.size > 0 and self.cfg.breakeven_enabled and self.state.position is not None:
+            ps = self.state.position
+            if ps.initial_stop_price > 0 and not ps.breakeven_triggered:
+                if check_breakeven_trigger(
+                    side=ps.side,
+                    entry_price=ps.entry_price,
+                    initial_stop_price=ps.initial_stop_price,
+                    high_price=row["high"],
+                    low_price=row["low"],
+                    trigger_r=self.cfg.breakeven_trigger_r,
+                ):
+                    new_stop = compute_breakeven_stop_price(
+                        ps.side, ps.entry_price, tick_size=self.filters.tick_size
+                    )
+                    stop_ok = self.exchange.ensure_trading_stop(
+                        self.cfg.symbol, new_stop, self.filters.tick_size
+                    )
+                    if stop_ok:
+                        ps.stop_price = new_stop
+                        ps.breakeven_triggered = True
+                        self.state_mgr.save(self.state)
+                        self.logger.info(f"Breakeven triggered for {ps.side}: stop moved to ${new_stop:,.2f}")
+                        self.notifier.send_alert(
+                            f"🔒 *Breakeven*: stop moved to ${new_stop:,.2f} "
+                            f"(reached {self.cfg.breakeven_trigger_r}R from entry ${ps.entry_price:,.2f})",
+                            level="INFO",
+                        )
+                    else:
+                        self.logger.warning("Breakeven stop move failed to verify on exchange; will retry next bar.")
+
         # Step 1: If In Position -> Check Channel Exit
         if pos.size > 0:
             if check_channel_exit(pos.side, close_p, xh, xl):
@@ -627,6 +761,8 @@ class RapidBot:
                             stop_price=actual_stop,
                             entry_bar_ts=bar_ts,
                             entry_order_id=order_id or "dry_run",
+                            initial_stop_price=actual_stop,
+                            breakeven_triggered=False,
                         )
                         self.state_mgr.save(self.state)
 
