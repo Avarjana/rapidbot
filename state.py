@@ -20,6 +20,7 @@ class PositionState:
     entry_order_id: str
     initial_stop_price: float = 0.0  # frozen at entry; stop_price may move (breakeven), this doesn't
     breakeven_triggered: bool = False
+    stage2_triggered: bool = False  # second ratchet: locks in stage2_lock_r * R profit
 
 
 @dataclass

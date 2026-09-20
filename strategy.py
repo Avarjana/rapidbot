@@ -240,3 +240,27 @@ def compute_breakeven_stop_price(
         raw = entry_price * (1 - 2 * taker_fee_rate)
 
     return quantize_price(raw, tick_size)
+
+
+def compute_locked_profit_stop_price(
+    side: str,
+    entry_price: float,
+    initial_stop_price: float,
+    lock_r: float,
+    tick_size: float = 0.1,
+) -> float:
+    """Second-stage stop: after breakeven, lock in `lock_r` multiples of the
+    initial risk (R = |entry - initial_stop|) once the trade has run further
+    in its favor. Reuses check_breakeven_trigger() (same trigger mechanic, a
+    higher R threshold) to decide WHEN to call this.
+
+    Backtested and validated (train/test split) in backtest_staged_breakeven.py
+    before being wired in here.
+    """
+    r = abs(entry_price - initial_stop_price)
+    if side in ("Buy", "long", "Long"):
+        raw = entry_price + lock_r * r
+    else:
+        raw = entry_price - lock_r * r
+
+    return quantize_price(raw, tick_size)

@@ -32,6 +32,7 @@ from strategy import (
     check_channel_exit,
     compute_breakeven_stop_price,
     compute_indicators,
+    compute_locked_profit_stop_price,
     compute_position_size,
     compute_stop_price,
     evaluate_signal,
@@ -248,6 +249,17 @@ class RapidBot:
                     lines.append(f"  Breakeven: stop moves to ~${ps.entry_price:,.2f} on 1h high/low reaching ${trig:,.2f} ({away(trig)})")
                 else:
                     lines.append("  Breakeven: not tracked for this position (opened before this feature)")
+
+            if self.cfg.stage2_enabled and ps is not None and ps.initial_stop_price > 0:
+                r = abs(ps.entry_price - ps.initial_stop_price)
+                lock_price = ps.entry_price + self.cfg.stage2_lock_r * r if pos.side == "Buy" else ps.entry_price - self.cfg.stage2_lock_r * r
+                if ps.stage2_triggered:
+                    lines.append(f"  Stage 2: already triggered, stop locked at ${ps.stop_price:,.2f}")
+                elif ps.breakeven_triggered:
+                    trig2 = ps.entry_price + self.cfg.stage2_trigger_r * r if pos.side == "Buy" else ps.entry_price - self.cfg.stage2_trigger_r * r
+                    lines.append(f"  Stage 2: stop locks to ~${lock_price:,.2f} on 1h high/low reaching ${trig2:,.2f} ({away(trig2)})")
+                else:
+                    lines.append(f"  Stage 2: waiting on breakeven first (would then lock ~${lock_price:,.2f} at {self.cfg.stage2_trigger_r}R)")
             return "\n".join(lines)
 
         # Flat: the next order is an entry, if the mom30 veto allows that direction.
@@ -702,6 +714,42 @@ class RapidBot:
                     else:
                         self.logger.warning("Breakeven stop move failed to verify on exchange; will retry next bar.")
 
+        # Step 0b: Stage 2 -- after breakeven, lock in stage2_lock_r * R profit
+        # once price reaches stage2_trigger_r. Gated on breakeven already having
+        # fired (stage2_trigger_r > breakeven_trigger_r is enforced in config, so
+        # if price reached stage2 in this same bar, the stage-1 block above will
+        # have already run and set breakeven_triggered=True earlier in this pass).
+        if pos.size > 0 and self.cfg.stage2_enabled and self.state.position is not None:
+            ps = self.state.position
+            if ps.initial_stop_price > 0 and ps.breakeven_triggered and not ps.stage2_triggered:
+                if check_breakeven_trigger(
+                    side=ps.side,
+                    entry_price=ps.entry_price,
+                    initial_stop_price=ps.initial_stop_price,
+                    high_price=row["high"],
+                    low_price=row["low"],
+                    trigger_r=self.cfg.stage2_trigger_r,
+                ):
+                    new_stop = compute_locked_profit_stop_price(
+                        ps.side, ps.entry_price, ps.initial_stop_price,
+                        lock_r=self.cfg.stage2_lock_r, tick_size=self.filters.tick_size,
+                    )
+                    stop_ok = self.exchange.ensure_trading_stop(
+                        self.cfg.symbol, new_stop, self.filters.tick_size
+                    )
+                    if stop_ok:
+                        ps.stop_price = new_stop
+                        ps.stage2_triggered = True
+                        self.state_mgr.save(self.state)
+                        self.logger.info(f"Stage 2 triggered for {ps.side}: stop moved to ${new_stop:,.2f} (locking {self.cfg.stage2_lock_r}R)")
+                        self.notifier.send_alert(
+                            f"🔒🔒 *Profit locked*: stop moved to ${new_stop:,.2f} "
+                            f"(reached {self.cfg.stage2_trigger_r}R, locking in {self.cfg.stage2_lock_r}R profit)",
+                            level="INFO",
+                        )
+                    else:
+                        self.logger.warning("Stage 2 stop move failed to verify on exchange; will retry next bar.")
+
         # Step 1: If In Position -> Check Channel Exit
         if pos.size > 0:
             if check_channel_exit(pos.side, close_p, xh, xl):
@@ -763,6 +811,7 @@ class RapidBot:
                             entry_order_id=order_id or "dry_run",
                             initial_stop_price=actual_stop,
                             breakeven_triggered=False,
+                            stage2_triggered=False,
                         )
                         self.state_mgr.save(self.state)
 

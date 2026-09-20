@@ -30,6 +30,9 @@ class Config:
     allow_short: bool
     breakeven_enabled: bool
     breakeven_trigger_r: float
+    stage2_enabled: bool
+    stage2_trigger_r: float
+    stage2_lock_r: float
 
     # Sizing
     base_capital: float
@@ -119,6 +122,10 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
     breakeven_enabled = env.get("BREAKEVEN_ENABLED", "1").lower() in ("1", "true", "yes")
     breakeven_trigger_r = float(env.get("BREAKEVEN_TRIGGER_R", "2.0"))
 
+    stage2_enabled = env.get("STAGE2_ENABLED", "1").lower() in ("1", "true", "yes")
+    stage2_trigger_r = float(env.get("STAGE2_TRIGGER_R", "3.0"))
+    stage2_lock_r = float(env.get("STAGE2_LOCK_R", "1.0"))
+
     base_capital = float(env.get("BASE_CAPITAL", "100.0"))
     risk_frac = float(env.get("RISK_FRAC", "0.05"))
     max_leverage = float(env.get("MAX_LEVERAGE", "5.0"))
@@ -146,6 +153,10 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
         f"WARMUP_BARS ({warmup_bars}) must be >= {entry_channel_hours + atr_period}"
     )
     assert breakeven_trigger_r > 0, f"BREAKEVEN_TRIGGER_R must be > 0, got {breakeven_trigger_r}"
+    assert stage2_trigger_r > breakeven_trigger_r, (
+        f"STAGE2_TRIGGER_R ({stage2_trigger_r}) must be > BREAKEVEN_TRIGGER_R ({breakeven_trigger_r})"
+    )
+    assert stage2_lock_r > 0, f"STAGE2_LOCK_R must be > 0, got {stage2_lock_r}"
     assert capital_policy in ("skim_refill", "compound"), f"Invalid capital policy: {capital_policy}"
     assert base_capital > 0, "BASE_CAPITAL must be positive"
     assert 0 < risk_frac <= 0.20, f"RISK_FRAC must be in (0, 0.20], got {risk_frac}"
@@ -174,6 +185,9 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
         allow_short=allow_short,
         breakeven_enabled=breakeven_enabled,
         breakeven_trigger_r=breakeven_trigger_r,
+        stage2_enabled=stage2_enabled,
+        stage2_trigger_r=stage2_trigger_r,
+        stage2_lock_r=stage2_lock_r,
         base_capital=base_capital,
         risk_frac=risk_frac,
         max_leverage=max_leverage,
