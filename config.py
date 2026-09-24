@@ -30,6 +30,7 @@ class Config:
     allow_short: bool
     breakeven_enabled: bool
     breakeven_trigger_r: float
+    stage1_lock_r: float
     stage2_enabled: bool
     stage2_trigger_r: float
     stage2_lock_r: float
@@ -121,9 +122,10 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
 
     breakeven_enabled = env.get("BREAKEVEN_ENABLED", "1").lower() in ("1", "true", "yes")
     breakeven_trigger_r = float(env.get("BREAKEVEN_TRIGGER_R", "2.0"))
+    stage1_lock_r = float(env.get("STAGE1_LOCK_R", "0.5"))
 
     stage2_enabled = env.get("STAGE2_ENABLED", "1").lower() in ("1", "true", "yes")
-    stage2_trigger_r = float(env.get("STAGE2_TRIGGER_R", "3.0"))
+    stage2_trigger_r = float(env.get("STAGE2_TRIGGER_R", "2.5"))
     stage2_lock_r = float(env.get("STAGE2_LOCK_R", "1.0"))
 
     base_capital = float(env.get("BASE_CAPITAL", "100.0"))
@@ -157,6 +159,9 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
         f"STAGE2_TRIGGER_R ({stage2_trigger_r}) must be > BREAKEVEN_TRIGGER_R ({breakeven_trigger_r})"
     )
     assert stage2_lock_r > 0, f"STAGE2_LOCK_R must be > 0, got {stage2_lock_r}"
+    assert 0 <= stage1_lock_r < stage2_lock_r, (
+        f"STAGE1_LOCK_R ({stage1_lock_r}) must be >= 0 and < STAGE2_LOCK_R ({stage2_lock_r})"
+    )
     assert capital_policy in ("skim_refill", "compound"), f"Invalid capital policy: {capital_policy}"
     assert base_capital > 0, "BASE_CAPITAL must be positive"
     assert 0 < risk_frac <= 0.20, f"RISK_FRAC must be in (0, 0.20], got {risk_frac}"
@@ -185,6 +190,7 @@ def load_config(filepath: str | Path = ".env.rapid") -> Config:
         allow_short=allow_short,
         breakeven_enabled=breakeven_enabled,
         breakeven_trigger_r=breakeven_trigger_r,
+        stage1_lock_r=stage1_lock_r,
         stage2_enabled=stage2_enabled,
         stage2_trigger_r=stage2_trigger_r,
         stage2_lock_r=stage2_lock_r,

@@ -1,37 +1,88 @@
-"""Backtest a SECOND staged stop ratchet layered on top of the already-deployed
-2R breakeven move (strategy.check_breakeven_trigger / compute_breakeven_stop_price):
+"""Backtest replacing the entry threshold (entry_high/entry_low, the single
+40-day extreme) with the AVERAGE of the top-N highs / bottom-N lows within the
+same 40-day window -- smooths out a single anomalous wick's influence while
+still tracking genuine resistance/support structure. N=1 reproduces the
+production single-extreme threshold exactly.
 
-  Stage 1 (already live): at trigger_r_1 (R = |entry - initial_stop|), stop
-    jumps to breakeven + fee buffer. [matches main.py exactly]
-  Stage 2 (new, proposed here): at trigger_r_2 (> trigger_r_1), stop jumps
-    again to lock_r_2 multiples of R in profit. After this, no further staged
-    jumps -- the channel exit ("bottom bar") manages the rest of the trade,
-    exactly like today.
-
-Both stages are one-time ratchets, not continuous trailing -- same mechanism
-family as the deployed feature, not the continuous-trailing idea already
-rejected earlier this session. Entries, sizing, initial ATR stop, and channel
-exit are all untouched production logic.
+Everything else is the currently-deployed exit stack, untouched: entries'
+momentum filter, position sizing, initial ATR stop, channel exit ("bottom
+bar", unchanged single 20-day extreme), 2R breakeven, 3R->1R profit lock.
 """
 
 import argparse
 from typing import Dict, Optional
+import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
 from backtest import load_dataset, print_summary
 from strategy import (
-    compute_indicators,
+    compute_wilder_atr_series,
     evaluate_signal,
     compute_position_size,
     compute_stop_price,
     check_channel_exit,
     check_breakeven_trigger,
     compute_breakeven_stop_price,
+    compute_locked_profit_stop_price,
 )
 from risk import apply_capital_policy
 
 
-def run_staged_breakeven_backtest(
+def rolling_top_n_mean(values: np.ndarray, window: int, n: int) -> np.ndarray:
+    """out[i] = mean of the top n values in values[i-window+1 : i+1]. NaN before that."""
+    out = np.full(len(values), np.nan)
+    if len(values) < window:
+        return out
+    sw = sliding_window_view(values, window)
+    top_n = np.partition(sw, window - n, axis=1)[:, window - n:]
+    out[window - 1:] = top_n.mean(axis=1)
+    return out
+
+
+def rolling_bottom_n_mean(values: np.ndarray, window: int, n: int) -> np.ndarray:
+    out = np.full(len(values), np.nan)
+    if len(values) < window:
+        return out
+    sw = sliding_window_view(values, window)
+    bottom_n = np.partition(sw, n - 1, axis=1)[:, :n]
+    out[window - 1:] = bottom_n.mean(axis=1)
+    return out
+
+
+def compute_avg_extreme_indicators(
+    df: pd.DataFrame,
+    entry_channel_hours: int = 960,
+    exit_channel_hours: int = 480,
+    mom_hours: int = 720,
+    atr_period: int = 14,
+    entry_top_n: int = 1,
+) -> pd.DataFrame:
+    res = df.copy()
+
+    high = res["high"].to_numpy(dtype=float)
+    low = res["low"].to_numpy(dtype=float)
+
+    top_n_high = rolling_top_n_mean(high, entry_channel_hours, entry_top_n)
+    bottom_n_low = rolling_bottom_n_mean(low, entry_channel_hours, entry_top_n)
+    # shift(1): no-lookahead, same convention as the production single-extreme version
+    res["entry_high"] = pd.Series(top_n_high, index=res.index).shift(1)
+    res["entry_low"] = pd.Series(bottom_n_low, index=res.index).shift(1)
+
+    # Channel exit ("bottom bar") stays the untouched single-extreme version
+    res["exit_high"] = res["high"].rolling(window=exit_channel_hours).max().shift(1)
+    res["exit_low"] = res["low"].rolling(window=exit_channel_hours).min().shift(1)
+
+    if mom_hours > 0:
+        res["mom30"] = res["close"] / res["close"].shift(mom_hours) - 1.0
+    else:
+        res["mom30"] = 0.0
+
+    res["atr"] = compute_wilder_atr_series(res["high"], res["low"], res["close"], period=atr_period)
+    return res
+
+
+def run_avg_extreme_backtest(
     df: pd.DataFrame,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -45,14 +96,14 @@ def run_staged_breakeven_backtest(
     atr_mult: float = 3.0,
     risk_frac: float = 0.05,
     max_leverage: float = 5.0,
-    trigger_r_1: float = 2.0,             # matches deployed config
-    lock_r_1: float = 0.0,                # 0 = breakeven+fees (deployed); >0 = lock this many R at stage 1
-    trigger_r_2: Optional[float] = 3.0,   # None = stage 2 disabled (reproduces deployed behavior)
-    lock_r_2: float = 1.0,
+    entry_top_n: int = 1,
+    breakeven_trigger_r: float = 2.0,
+    stage2_trigger_r: float = 3.0,
+    stage2_lock_r: float = 1.0,
 ) -> Dict:
-    data = compute_indicators(
+    data = compute_avg_extreme_indicators(
         df, entry_channel_hours=entry_channel_hours, exit_channel_hours=exit_channel_hours,
-        mom_hours=mom_hours, atr_period=atr_period,
+        mom_hours=mom_hours, atr_period=atr_period, entry_top_n=entry_top_n,
     )
     if start_date:
         data = data.loc[start_date:]
@@ -66,15 +117,13 @@ def run_staged_breakeven_backtest(
     pos_entry_price = 0.0
     pos_stop_price = 0.0
     pos_initial_stop = 0.0
-    pos_stage = 0  # 0 = nothing triggered, 1 = breakeven done, 2 = stage-2 done
+    pos_stage = 0
     pos_entry_time = None
     cum_fees = 0.0
     cum_funding = 0.0
 
     trades = []
     equity_curve = []
-    stage1_count = 0
-    stage2_count = 0
 
     for ts, row in data.iterrows():
         close_p = row["close"]
@@ -89,47 +138,27 @@ def run_staged_breakeven_backtest(
             float_usdt -= f_cost
             cum_funding += f_cost
 
-        # --- Stage 1: breakeven at trigger_r_1 (identical to what's deployed) ---
         if pos_side is not None and pos_stage == 0:
-            if check_breakeven_trigger(
-                side=pos_side, entry_price=pos_entry_price, initial_stop_price=pos_initial_stop,
-                high_price=high_p, low_price=low_p, trigger_r=trigger_r_1,
-            ):
-                if lock_r_1 > 0:
-                    r1 = abs(pos_entry_price - pos_initial_stop)
-                    pos_stop_price = pos_entry_price + lock_r_1 * r1 if pos_side == "Buy" else pos_entry_price - lock_r_1 * r1
-                else:
-                    pos_stop_price = compute_breakeven_stop_price(pos_side, pos_entry_price, taker_fee_rate=taker_fee_rate)
+            if check_breakeven_trigger(pos_side, pos_entry_price, pos_initial_stop, high_p, low_p, breakeven_trigger_r):
+                pos_stop_price = compute_breakeven_stop_price(pos_side, pos_entry_price, taker_fee_rate=taker_fee_rate)
                 pos_stage = 1
-                stage1_count += 1
 
-        # --- Stage 2: lock in lock_r_2 * R profit at trigger_r_2 ---
-        if pos_side is not None and pos_stage == 1 and trigger_r_2 is not None:
-            r = abs(pos_entry_price - pos_initial_stop)
-            if pos_side == "Buy":
-                trigger_level = pos_entry_price + trigger_r_2 * r
-                if high_p >= trigger_level:
-                    pos_stop_price = max(pos_stop_price, pos_entry_price + lock_r_2 * r)
-                    pos_stage = 2
-                    stage2_count += 1
-            else:
-                trigger_level = pos_entry_price - trigger_r_2 * r
-                if low_p <= trigger_level:
-                    pos_stop_price = min(pos_stop_price, pos_entry_price - lock_r_2 * r)
-                    pos_stage = 2
-                    stage2_count += 1
+        if pos_side is not None and pos_stage == 1:
+            if check_breakeven_trigger(pos_side, pos_entry_price, pos_initial_stop, high_p, low_p, stage2_trigger_r):
+                r = abs(pos_entry_price - pos_initial_stop)
+                lock_price = pos_entry_price + stage2_lock_r * r if pos_side == "Buy" else pos_entry_price - stage2_lock_r * r
+                pos_stop_price = max(pos_stop_price, lock_price) if pos_side == "Buy" else min(pos_stop_price, lock_price)
+                pos_stage = 2
 
         stopped_out = False
         exit_price = 0.0
         exit_reason = None
         if pos_side == "Buy":
             if low_p <= pos_stop_price:
-                stopped_out, exit_price = True, pos_stop_price
-                exit_reason = f"stop_stage{pos_stage}"
+                stopped_out, exit_price, exit_reason = True, pos_stop_price, f"stop_stage{pos_stage}"
         elif pos_side == "Sell":
             if high_p >= pos_stop_price:
-                stopped_out, exit_price = True, pos_stop_price
-                exit_reason = f"stop_stage{pos_stage}"
+                stopped_out, exit_price, exit_reason = True, pos_stop_price, f"stop_stage{pos_stage}"
 
         if pos_side is not None and not stopped_out:
             if check_channel_exit(pos_side, close_p, row["exit_high"], row["exit_low"]):
@@ -141,10 +170,8 @@ def run_staged_breakeven_backtest(
             cum_fees += exit_fee
             net_trade_pnl = raw_pnl - exit_fee
             float_usdt += net_trade_pnl
-
             if capital_policy == "skim_refill":
                 float_usdt, bank_usdt = apply_capital_policy(float_usdt, bank_usdt, base_capital=base_capital, policy="skim_refill")
-
             trades.append({
                 "entry_time": str(pos_entry_time), "exit_time": str(ts), "side": pos_side, "qty": pos_qty,
                 "entry_price": pos_entry_price, "exit_price": exit_price, "raw_pnl": raw_pnl,
@@ -198,28 +225,20 @@ def run_staged_breakeven_backtest(
         "final_total": float_usdt + bank_usdt, "total_return_pct": total_return_pct,
         "max_drawdown_pct": max_dd_pct, "total_trades": len(trades_df), "win_rate_pct": win_rate,
         "cum_fees": cum_fees, "cum_funding": cum_funding, "trades": trades_df, "equity_curve": eq_df,
-        "stage1_count": stage1_count, "stage2_count": stage2_count,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Production strategy with staged breakeven + profit-lock ratchet")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--start", type=str, default=None)
     parser.add_argument("--end", type=str, default=None)
     parser.add_argument("--policy", choices=["skim_refill", "compound"], default="skim_refill")
-    parser.add_argument("--trigger-r1", type=float, default=2.0)
-    parser.add_argument("--trigger-r2", type=float, default=3.0)
-    parser.add_argument("--lock-r2", type=float, default=1.0)
-    parser.add_argument("--disable-stage2", action="store_true")
+    parser.add_argument("--entry-top-n", type=int, default=5)
     args = parser.parse_args()
 
     df = load_dataset()
-    res = run_staged_breakeven_backtest(
-        df, start_date=args.start, end_date=args.end, capital_policy=args.policy,
-        trigger_r_1=args.trigger_r1, trigger_r_2=None if args.disable_stage2 else args.trigger_r2, lock_r_2=args.lock_r2,
-    )
+    res = run_avg_extreme_backtest(df, start_date=args.start, end_date=args.end, capital_policy=args.policy, entry_top_n=args.entry_top_n)
     print_summary(res)
-    print(f"Stage1 (breakeven) triggers: {res['stage1_count']}  Stage2 (lock profit) triggers: {res['stage2_count']}")
 
 
 if __name__ == "__main__":

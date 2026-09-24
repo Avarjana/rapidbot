@@ -242,11 +242,12 @@ class RapidBot:
             ps = self.state.position
             if self.cfg.breakeven_enabled and ps is not None:
                 if ps.breakeven_triggered:
-                    lines.append(f"  Breakeven: already triggered, stop is at breakeven+fees")
+                    lines.append(f"  Stage 1: already triggered (locked {self.cfg.stage1_lock_r}R)")
                 elif ps.initial_stop_price > 0:
                     r = abs(ps.entry_price - ps.initial_stop_price)
                     trig = ps.entry_price + self.cfg.breakeven_trigger_r * r if pos.side == "Buy" else ps.entry_price - self.cfg.breakeven_trigger_r * r
-                    lines.append(f"  Breakeven: stop moves to ~${ps.entry_price:,.2f} on 1h high/low reaching ${trig:,.2f} ({away(trig)})")
+                    s1 = ps.entry_price + self.cfg.stage1_lock_r * r if pos.side == "Buy" else ps.entry_price - self.cfg.stage1_lock_r * r
+                    lines.append(f"  Stage 1: stop moves to ~${s1:,.2f} ({self.cfg.stage1_lock_r}R) on 1h high/low reaching ${trig:,.2f} ({away(trig)})")
                 else:
                     lines.append("  Breakeven: not tracked for this position (opened before this feature)")
 
@@ -695,9 +696,15 @@ class RapidBot:
                     low_price=row["low"],
                     trigger_r=self.cfg.breakeven_trigger_r,
                 ):
-                    new_stop = compute_breakeven_stop_price(
-                        ps.side, ps.entry_price, tick_size=self.filters.tick_size
-                    )
+                    if self.cfg.stage1_lock_r > 0:
+                        new_stop = compute_locked_profit_stop_price(
+                            ps.side, ps.entry_price, ps.initial_stop_price,
+                            lock_r=self.cfg.stage1_lock_r, tick_size=self.filters.tick_size,
+                        )
+                    else:
+                        new_stop = compute_breakeven_stop_price(
+                            ps.side, ps.entry_price, tick_size=self.filters.tick_size
+                        )
                     stop_ok = self.exchange.ensure_trading_stop(
                         self.cfg.symbol, new_stop, self.filters.tick_size
                     )
@@ -708,7 +715,7 @@ class RapidBot:
                         self.logger.info(f"Breakeven triggered for {ps.side}: stop moved to ${new_stop:,.2f}")
                         self.notifier.send_alert(
                             f"🔒 *Breakeven*: stop moved to ${new_stop:,.2f} "
-                            f"(reached {self.cfg.breakeven_trigger_r}R from entry ${ps.entry_price:,.2f})",
+                            f"(reached {self.cfg.breakeven_trigger_r}R from entry ${ps.entry_price:,.2f}, locking {self.cfg.stage1_lock_r}R)",
                             level="INFO",
                         )
                     else:
